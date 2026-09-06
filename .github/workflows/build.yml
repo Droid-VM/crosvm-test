@@ -28,7 +28,7 @@ jobs:
 
       - name: Checkout Droid-VM forks
         run: |
-          cd meta
+          cd ~
           for p in external/crosvm hardware/google/gfxstream external/virglrenderer \
                    packages/modules/Virtualization external/libvncserver external/zstd; do
             name=$(basename "$p")
