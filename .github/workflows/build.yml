@@ -1,0 +1,201 @@
+name: Build crosvm + DroidVM APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-crosvm:
+    runs-on: self-hosted
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-pip git-core git-lfs \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu
+          sudo apt-get clean
+
+      - name: Install repo
+        run: |
+          sudo curl -o /usr/local/bin/repo https://storage.googleapis.com/git-repo-downloads/repo
+          sudo chmod a+x /usr/local/bin/repo
+
+      - name: Checkout meta repo
+        uses: actions/checkout@v4
+        with:
+          path: meta
+
+      - name: Repo init
+        run: |
+          cd meta
+          mkdir -p crosvm_build
+          cd crosvm_build
+          repo init -u https://github.com/Droid-VM/crosvm-minimal-manifest.git \
+            -b droidvm -m crosvm-minimal.xml --depth 1
+
+      - name: Repo sync
+        run: |
+          cd meta/crosvm_build
+          repo sync -c --no-tags -j$(nproc)
+
+      - name: Checkout Droid-VM forks
+        run: |
+          cd meta
+          for p in external/crosvm hardware/google/gfxstream external/virglrenderer \
+                   packages/modules/Virtualization external/libvncserver external/zstd; do
+            name=$(basename "$p")
+            dir="crosvm_build/$p"
+            if [ -d "$dir" ]; then
+              if [ "$name" = "crosvm" ]; then
+                url="https://github.com/Alhkxsj/crosvm.git"
+              else
+                url="https://github.com/Droid-VM/$name.git"
+              fi
+              git -C "$dir" remote add droidvm "$url" 2>/dev/null || true
+              git -C "$dir" fetch -q droidvm droidvm
+              git -C "$dir" checkout -q -B droidvm FETCH_HEAD
+            fi
+          done
+
+      - name: Build boot shim
+        run: |
+          cd meta/crosvm_build/external/crosvm/droidvm-shim
+          cargo build --release --target aarch64-unknown-none-softfloat
+          mkdir -p ../out/shim
+          cp target/aarch64-unknown-none-softfloat/release/droidvm-shim ../out/shim/shim.elf
+          aarch64-linux-gnu-objcopy -O binary ../out/shim/shim.elf ../out/shim/shim.bin
+          cp ../out/shim/shim.bin ../hypervisor/src/gunyah/shim.bin
+
+      - name: Build crosvm
+        run: |
+          cd meta/crosvm_build
+          source build/envsetup.sh
+          lunch aosp_arm64 trunk_staging eng
+          ALLOW_MISSING_DEPENDENCIES=true TARGET_BUILD_UNBUNDLED=true m crosvm_device_only -j2
+
+      - name: Collect crosvm
+        run: |
+          cd meta/crosvm_build
+          mkdir -p crosvm_out
+          BIN=$(find out/soong/.intermediates/external/crosvm/crosvm_device_only/crosvm_device_only_bin \
+                -name crosvm 2>/dev/null | grep -v unstripped | head -1)
+          [ -n "$BIN" ] || { echo "ERROR: crosvm not found"; exit 1; }
+          cp -f "$BIN" crosvm_out/crosvm
+
+          RE=$(find prebuilts/clang/host/linux-x86 -name llvm-readelf 2>/dev/null | head -1)
+          SKIP="libc.so libdl.so libm.so"
+          needed() { "$RE" -d "$1" 2>/dev/null | awk -F'[][]' '/NEEDED/{print $2}'; }
+          findso() { find out/soong/.intermediates -path "*android_arm64*_shared*" -name "$1" 2>/dev/null \
+                     | grep -v unstripped | head -1; }
+          declare -A seen
+          queue=$(needed "$BIN")
+          while [ -n "$queue" ]; do
+            next=""
+            for so in $queue; do
+              case " $SKIP " in *" $so "*) continue;; esac
+              [ -n "${seen[$so]:-}" ] && continue; seen[$so]=1
+              src=$(findso "$so")
+              if [ -n "$src" ]; then
+                cp -f "$src" "crosvm_out/"
+                next="$next $(needed "$src")"
+              fi
+            done
+            queue="$next"
+          done
+
+      - name: Upload crosvm artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: crosvm_out
+          path: meta/crosvm_build/crosvm_out/
+          retention-days: 7
+
+  build-app:
+    needs: build-crosvm
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache \
+            /usr/local/lib/android /usr/local/graalvm /usr/local/share/boost /usr/share/swift
+          docker image prune -af
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-pip clang lld llvm make xz-utils libssl-dev
+          sudo apt-get clean
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Checkout DroidVM
+        uses: actions/checkout@v4
+        with:
+          repository: Droid-VM/DroidVM
+          submodules: recursive
+          fetch-depth: 0
+          path: DroidVM
+
+      - name: Checkout DroidVM-Prebuilt-Root
+        uses: actions/checkout@v4
+        with:
+          repository: Droid-VM/DroidVM-Prebuilt-Root
+          path: DroidVM/DroidVM-Prebuilt-Root
+
+      - name: Download crosvm artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: crosvm_out
+          path: crosvm_out/
+
+      - name: Build prebuilts + overlay crosvm
+        run: |
+          cd DroidVM/DroidVM-Prebuilt-Root
+          python3 auto-build.py --force
+
+          MB=manual-build/arm64-v8a
+          mkdir -p "$MB/usr/bin" "$MB/usr/lib"
+          cp -f ../../crosvm_out/crosvm "$MB/usr/bin/crosvm"
+          chmod 755 "$MB/usr/bin/crosvm"
+
+          for so in ../../crosvm_out/*.so; do
+            [ -f "$so" ] || continue
+            name=$(basename "$so")
+            case " libgui.so libaaudio.so libbinder_ndk.so libc++.so libbase.so libcap.so \
+                   libcutils.so liblog.so libminijail.so libnativewindow.so libprocessgroup.so " in
+              *" $name "*) continue;;
+            esac
+            cp -f "$so" "$MB/usr/lib/"
+          done
+
+          for so in libgui libaaudio libbinder_ndk libc++ libbase libcap libcutils liblog \
+                    libminijail libnativewindow libprocessgroup; do
+            rm -f "$MB/usr/lib/$so.so"
+          done
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: build-tools;36.0.0
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build APK
+        run: |
+          cd DroidVM
+          chmod +x gradlew
+          ./gradlew assembleRelease
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: DroidVM-apk
+          path: DroidVM/app/build/outputs/apk/release/*.apk
+          retention-days: 30
