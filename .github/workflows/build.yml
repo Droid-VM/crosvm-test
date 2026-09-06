@@ -1,4 +1,4 @@
-name: Build crosvm + DroidVM APK
+name: Build crosvm
 
 on:
   workflow_dispatch:
@@ -9,12 +9,10 @@ jobs:
     steps:
       - name: Checkout meta repo
         uses: actions/checkout@v4
-        with:
-          path: meta
 
       - name: Repo init
         run: |
-          cd meta
+          cd ~
           if ! [ -d "crosvm_build" ]; then
             mkdir -p crosvm_build
             cd crosvm_build
@@ -25,7 +23,7 @@ jobs:
 
       - name: Repo sync
         run: |
-          cd meta/crosvm_build
+          cd ~/crosvm_build
           repo sync -c --no-tags -j4
 
       - name: Checkout Droid-VM forks
@@ -49,7 +47,7 @@ jobs:
 
       - name: Build boot shim
         run: |
-          cd meta/crosvm_build/external/crosvm/droidvm-shim
+          cd ~/crosvm_build/external/crosvm/droidvm-shim
           cargo build --release --target aarch64-unknown-none-softfloat
           mkdir -p ../out/shim
           cp target/aarch64-unknown-none-softfloat/release/droidvm-shim ../out/shim/shim.elf
@@ -58,14 +56,14 @@ jobs:
 
       - name: Build crosvm
         run: |
-          cd meta/crosvm_build
+          cd ~/crosvm_build
           source build/envsetup.sh
           lunch aosp_arm64 trunk_staging eng
           ALLOW_MISSING_DEPENDENCIES=true TARGET_BUILD_UNBUNDLED=true m crosvm_device_only -j2
 
       - name: Collect crosvm
         run: |
-          cd meta/crosvm_build
+          cd ~/crosvm_build
           mkdir -p crosvm_out
           BIN=$(find out/soong/.intermediates/external/crosvm/crosvm_device_only/crosvm_device_only_bin \
                 -name crosvm 2>/dev/null | grep -v unstripped | head -1)
@@ -97,5 +95,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: crosvm_out
-          path: meta/crosvm_build/crosvm_out/
+          path: ~/crosvm_build/crosvm_out/
           retention-days: 7
